@@ -20,3 +20,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
 });
+
+app.get("/", (_req, res) => {
+  res.send("✅ Backend API is live! Use /tasks or /sync endpoints.");
+});
