@@ -1,43 +1,38 @@
-import { Router, Request, Response } from 'express';
-import { SyncService } from '../services/syncService';
-import { TaskService } from '../services/taskService';
-import { Database } from '../db/database';
+import { Router, Request, Response } from "express";
+import { SyncService } from "../services/syncService";
+import { TaskService } from "../services/taskService";
+import { Database } from "../db/database";
 
 export function createSyncRouter(db: Database): Router {
   const router = Router();
   const taskService = new TaskService(db);
-  const syncService = new SyncService(db, taskService);
+  const syncService = new SyncService(taskService);
 
-  // Trigger manual sync
-  router.post('/sync', async (req: Request, res: Response) => {
-    // TODO: Implement sync endpoint
-    // 1. Check connectivity first
-    // 2. Call syncService.sync()
-    // 3. Return sync result
-    res.status(501).json({ error: 'Not implemented' });
+  // 🔹 POST /sync → process client changes
+  router.post("/", async (req: Request, res: Response) => {
+    try {
+      const clientChanges = req.body;
+      if (!Array.isArray(clientChanges)) {
+        return res.status(400).json({ error: "Expected an array of sync items" });
+      }
+
+      const result = await syncService.processClientBatch(clientChanges);
+      res.json(result);
+    } catch (err: any) {
+      console.error("Sync error:", err);
+      res.status(500).json({ error: err.message || "Sync failed" });
+    }
   });
 
-  // Check sync status
-  router.get('/status', async (req: Request, res: Response) => {
-    // TODO: Implement sync status endpoint
-    // 1. Get pending sync count
-    // 2. Get last sync timestamp
-    // 3. Check connectivity
-    // 4. Return status summary
-    res.status(501).json({ error: 'Not implemented' });
-  });
-
-  // Batch sync endpoint (for server-side)
-  router.post('/batch', async (req: Request, res: Response) => {
-    // TODO: Implement batch sync endpoint
-    // This would be implemented on the server side
-    // to handle batch sync requests from clients
-    res.status(501).json({ error: 'Not implemented' });
-  });
-
-  // Health check endpoint
-  router.get('/health', async (req: Request, res: Response) => {
-    res.json({ status: 'ok', timestamp: new Date() });
+  // 🔹 GET /sync/snapshot → get server snapshot
+  router.get("/snapshot", async (_req: Request, res: Response) => {
+    try {
+      const snapshot = await syncService.getServerSnapshot();
+      res.json({ serverState: snapshot });
+    } catch (err: any) {
+      console.error("Snapshot error:", err);
+      res.status(500).json({ error: err.message || "Snapshot failed" });
+    }
   });
 
   return router;

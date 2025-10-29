@@ -1,56 +1,110 @@
-import { v4 as uuidv4 } from 'uuid';
-import { Task } from '../types';
-import { Database } from '../db/database';
+// src/services/taskService.ts
+import { v4 as uuidv4 } from "uuid";
+
+export type Task = {
+  id: string;
+  title: string;
+  description?: string;
+  completed: boolean;
+  createdAt: string; // ISO
+  updatedAt: string; // ISO - used by LWW
+  // optional tombstone marker for deletes if needed
+  deleted?: boolean;
+};
 
 export class TaskService {
-  constructor(private db: Database) {}
+  private tasks: Map<string, Task> = new Map();
 
-  async createTask(taskData: Partial<Task>): Promise<Task> {
-    // TODO: Implement task creation
-    // 1. Generate UUID for the task
-    // 2. Set default values (completed: false, is_deleted: false)
-    // 3. Set sync_status to 'pending'
-    // 4. Insert into database
-    // 5. Add to sync queue
-    throw new Error('Not implemented');
+  constructor(initialTasks?: Task[]) {
+    if (initialTasks && initialTasks.length) {
+      for (const t of initialTasks) this.tasks.set(t.id, t);
+    }
   }
 
-  async updateTask(id: string, updates: Partial<Task>): Promise<Task | null> {
-    // TODO: Implement task update
-    // 1. Check if task exists
-    // 2. Update task in database
-    // 3. Update updated_at timestamp
-    // 4. Set sync_status to 'pending'
-    // 5. Add to sync queue
-    throw new Error('Not implemented');
+  private nowIso() {
+    return new Date().toISOString();
   }
 
-  async deleteTask(id: string): Promise<boolean> {
-    // TODO: Implement soft delete
-    // 1. Check if task exists
-    // 2. Set is_deleted to true
-    // 3. Update updated_at timestamp
-    // 4. Set sync_status to 'pending'
-    // 5. Add to sync queue
-    throw new Error('Not implemented');
+  async getAll(includeDeleted = false): Promise<Task[]> {
+    const out = Array.from(this.tasks.values()).filter(t => includeDeleted ? true : !t.deleted);
+    // sort by updatedAt desc
+    out.sort((a, b) => (a.updatedAt > b.updatedAt ? -1 : 1));
+    return out;
   }
 
-  async getTask(id: string): Promise<Task | null> {
-    // TODO: Implement get single task
-    // 1. Query database for task by id
-    // 2. Return null if not found or is_deleted is true
-    throw new Error('Not implemented');
+  async getById(id: string): Promise<Task | null> {
+    const t = this.tasks.get(id) ?? null;
+    if (t && t.deleted) return null;
+    return t;
   }
 
-  async getAllTasks(): Promise<Task[]> {
-    // TODO: Implement get all non-deleted tasks
-    // 1. Query database for all tasks where is_deleted = false
-    // 2. Return array of tasks
-    throw new Error('Not implemented');
+  async create(payload: Partial<Task> & { title: string }): Promise<Task> {
+    const now = this.nowIso();
+    const newTask: Task = {
+      id: uuidv4(),
+      title: payload.title,
+      description: payload.description ?? "",
+      completed: !!payload.completed,
+      createdAt: now,
+      updatedAt: now,
+      deleted: false,
+    };
+    this.tasks.set(newTask.id, newTask);
+    return newTask;
   }
 
-  async getTasksNeedingSync(): Promise<Task[]> {
-    // TODO: Get all tasks with sync_status = 'pending' or 'error'
-    throw new Error('Not implemented');
+  async update(id: string, patch: Partial<Task> & { updatedAt?: string }): Promise<Task | null> {
+    const existing = this.tasks.get(id);
+    if (!existing) return null;
+    // Respect provided updatedAt if client provides, otherwise set now
+    const incomingUpdatedAt = patch.updatedAt ?? this.nowIso();
+
+    // Apply fields (but do not override id/createdAt)
+    const updated: Task = {
+      ...existing,
+      title: patch.title ?? existing.title,
+      description: patch.description ?? existing.description,
+      completed: typeof patch.completed === "boolean" ? patch.completed : existing.completed,
+      updatedAt: incomingUpdatedAt,
+      deleted: patch.deleted ?? existing.deleted,
+    };
+
+    this.tasks.set(id, updated);
+    return updated;
+  }
+
+  async delete(id: string, opts?: { updatedAt?: string }): Promise<Task | null> {
+    const existing = this.tasks.get(id);
+    if (!existing) return null;
+    const updatedAt = opts?.updatedAt ?? this.nowIso();
+    const tombstone: Task = {
+      ...existing,
+      deleted: true,
+      updatedAt,
+    };
+    this.tasks.set(id, tombstone);
+    return tombstone;
+  }
+
+  // Apply a remote/other-source task (used by syncService). Uses LWW: choose newest updatedAt.
+  // Returns {applied: boolean, resultingTask}
+  async applyRemote(task: Task): Promise<{ applied: boolean; resultingTask: Task }> {
+    const id = task.id;
+    const existing = this.tasks.get(id);
+    if (!existing) {
+      // No local copy -> accept remote
+      this.tasks.set(id, task);
+      return { applied: true, resultingTask: task };
+    }
+
+    // Compare updatedAt strings (ISO lexicographic comparison works for ISO)
+    if (task.updatedAt > existing.updatedAt) {
+      // remote wins (LWW)
+      this.tasks.set(id, task);
+      return { applied: true, resultingTask: task };
+    } else {
+      // local wins: keep local state
+      return { applied: false, resultingTask: existing };
+    }
   }
 }

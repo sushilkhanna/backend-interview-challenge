@@ -1,81 +1,103 @@
-import axios from 'axios';
-import { Task, SyncQueueItem, SyncResult, BatchSyncRequest, BatchSyncResponse } from '../types';
-import { Database } from '../db/database';
-import { TaskService } from './taskService';
+// src/services/syncService.ts
+import { TaskService, Task } from "./taskService";
+
+export type SyncOperationType = "create" | "update" | "delete";
+
+export type SyncQueueItem = {
+  op: SyncOperationType;
+  task: Task;
+};
+
+export type SyncResultItem = {
+  op: SyncOperationType;
+  id: string;
+  applied: boolean;
+  serverTask?: Task;
+  reason?: string;
+};
 
 export class SyncService {
-  private apiUrl: string;
-  
-  constructor(
-    private db: Database,
-    private taskService: TaskService,
-    apiUrl: string = process.env.API_BASE_URL || 'http://localhost:3000/api'
-  ) {
-    this.apiUrl = apiUrl;
-  }
+  constructor(private taskService: TaskService) {}
 
-  async sync(): Promise<SyncResult> {
-    // TODO: Main sync orchestration method
-    // 1. Get all items from sync queue
-    // 2. Group items by batch (use SYNC_BATCH_SIZE from env)
-    // 3. Process each batch
-    // 4. Handle success/failure for each item
-    // 5. Update sync status in database
-    // 6. Return sync result summary
-    throw new Error('Not implemented');
-  }
+  /**
+   * Process a batch of client changes using LWW (Last-Writer-Wins)
+   *
+   * Client sends an array of SyncQueueItem.
+   *
+   * For each item:
+   * - If op=create and the server has no record -> create
+   * - If op=create but server has an existing id -> applyRemote (LWW)
+   * - If op=update -> applyRemote (LWW)
+   * - If op=delete -> treat as tombstone with updatedAt; applyRemote (LWW)
+   *
+   * Returns: results array + server state snapshot
+   */
+  async processClientBatch(items: SyncQueueItem[]): Promise<{ results: SyncResultItem[]; serverState: Task[] }> {
+    const results: SyncResultItem[] = [];
 
-  async addToSyncQueue(taskId: string, operation: 'create' | 'update' | 'delete', data: Partial<Task>): Promise<void> {
-    // TODO: Add operation to sync queue
-    // 1. Create sync queue item
-    // 2. Store serialized task data
-    // 3. Insert into sync_queue table
-    throw new Error('Not implemented');
-  }
+    for (const item of items) {
+      try {
+        const t = item.task;
+        if (!t || !t.id) {
+          results.push({
+            op: item.op,
+            id: t?.id ?? "unknown",
+            applied: false,
+            reason: "invalid_task",
+          });
+          continue;
+        }
 
-  private async processBatch(items: SyncQueueItem[]): Promise<BatchSyncResponse> {
-    // TODO: Process a batch of sync items
-    // 1. Prepare batch request
-    // 2. Send to server
-    // 3. Handle response
-    // 4. Apply conflict resolution if needed
-    throw new Error('Not implemented');
-  }
-
-  private async resolveConflict(localTask: Task, serverTask: Task): Promise<Task> {
-    // TODO: Implement last-write-wins conflict resolution
-    // 1. Compare updated_at timestamps
-    // 2. Return the more recent version
-    // 3. Log conflict resolution decision
-    throw new Error('Not implemented');
-  }
-
-  private async updateSyncStatus(taskId: string, status: 'synced' | 'error', serverData?: Partial<Task>): Promise<void> {
-    // TODO: Update task sync status
-    // 1. Update sync_status field
-    // 2. Update server_id if provided
-    // 3. Update last_synced_at timestamp
-    // 4. Remove from sync queue if successful
-    throw new Error('Not implemented');
-  }
-
-  private async handleSyncError(item: SyncQueueItem, error: Error): Promise<void> {
-    // TODO: Handle sync errors
-    // 1. Increment retry count
-    // 2. Store error message
-    // 3. If retry count exceeds limit, mark as permanent failure
-    throw new Error('Not implemented');
-  }
-
-  async checkConnectivity(): Promise<boolean> {
-    // TODO: Check if server is reachable
-    // 1. Make a simple health check request
-    // 2. Return true if successful, false otherwise
-    try {
-      await axios.get(`${this.apiUrl}/health`, { timeout: 5000 });
-      return true;
-    } catch {
-      return false;
+        switch (item.op) {
+          case "create": {
+            // If server doesn't have it, create a new server task (but keep client's id)
+            const existing = await this.taskService.getById(t.id);
+            if (!existing) {
+              // create using client's timestamp
+              await this.taskService.applyRemote(t);
+              results.push({ op: "create", id: t.id, applied: true, serverTask: t });
+            } else {
+              // existing: do LWW resolution
+              const sr = await this.taskService.applyRemote(t);
+              results.push({ op: "create", id: t.id, applied: sr.applied, serverTask: sr.resultingTask });
+            }
+            break;
+          }
+          case "update": {
+            // LWW via applyRemote
+            const sr = await this.taskService.applyRemote(t);
+            results.push({ op: "update", id: t.id, applied: sr.applied, serverTask: sr.resultingTask });
+            break;
+          }
+          case "delete": {
+            // Convert to tombstone if needed and applyRemote
+            const tombstone: Task = { ...t, deleted: true };
+            const sr = await this.taskService.applyRemote(tombstone);
+            results.push({ op: "delete", id: t.id, applied: sr.applied, serverTask: sr.resultingTask });
+            break;
+          }
+          default: {
+            results.push({ op: item.op, id: t.id, applied: false, reason: "unsupported_op" });
+            break;
+          }
+        }
+      } catch (err: any) {
+        results.push({
+          op: item.op,
+          id: item.task?.id ?? "unknown",
+          applied: false,
+          reason: `exception:${err?.message ?? String(err)}`,
+        });
+      }
     }
+
+    const serverState = await this.taskService.getAll(false);
+
+    return { results, serverState };
+  }
+
+  // Helper to get server snapshot
+  async getServerSnapshot(): Promise<Task[]> {
+    return this.taskService.getAll(false);
   }
 }
